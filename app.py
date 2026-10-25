@@ -9,9 +9,10 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QTreeWidget, QTreeWidgetItem, QLabel, QMessageBox,
-    QProgressBar, QAbstractItemView, QHeaderView)
+    QProgressBar, QAbstractItemView, QHeaderView, QInputDialog, QMenu)
 CHUNK = 1024 * 1024
 
 def fmt_size(n):
@@ -128,6 +129,13 @@ class Window(QMainWindow):
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.tree.itemDoubleClicked.connect(self.open_file)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_context_menu)
+        rename_action = QAction('เปลี่ยนชื่อ', self.tree)
+        rename_action.setShortcut(QKeySequence(Qt.Key.Key_F2))
+        rename_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        rename_action.triggered.connect(self.rename_selected)
+        self.tree.addAction(rename_action)
         layout.addWidget(self.tree)
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
@@ -262,6 +270,59 @@ class Window(QMainWindow):
         except OSError as error:
             QMessageBox.warning(self, 'เปิดไฟล์ไม่สำเร็จ', f'{path}\n\n{error}')
 
+    def show_context_menu(self, position):
+        item = self.tree.itemAt(position)
+        if not item or not isinstance(item.data(0, Qt.ItemDataRole.UserRole), tuple):
+            return
+        self.tree.clearSelection()
+        self.tree.setCurrentItem(item)
+        item.setSelected(True)
+        menu = QMenu(self)
+        rename_action = menu.addAction('เปลี่ยนชื่อ\tF2')
+        rename_action.triggered.connect(self.rename_selected)
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def rename_selected(self):
+        items = self.tree.selectedItems()
+        if len(items) != 1 or not isinstance(items[0].data(0, Qt.ItemDataRole.UserRole), tuple):
+            return
+        data = items[0].data(0, Qt.ItemDataRole.UserRole)
+        old_path = data[0]
+        if not os.path.isfile(old_path):
+            QMessageBox.warning(self, 'ไม่พบไฟล์', old_path)
+            return
+        new_name, accepted = QInputDialog.getText(
+            self, 'เปลี่ยนชื่อไฟล์', 'ชื่อใหม่:', text=os.path.basename(old_path))
+        if not accepted:
+            return
+        new_name = new_name.strip()
+        if (not new_name or new_name in ('.', '..') or
+                any(char in new_name for char in '<>:"/\\|?*') or
+                new_name.endswith(('.', ' '))):
+            QMessageBox.warning(self, 'ชื่อไฟล์ไม่ถูกต้อง', 'กรุณาระบุชื่อไฟล์ที่ใช้ได้')
+            return
+        new_path = os.path.join(os.path.dirname(old_path), new_name)
+        if os.path.normcase(new_path) == os.path.normcase(old_path):
+            return
+        if os.path.exists(new_path):
+            QMessageBox.warning(self, 'มีไฟล์ชื่อนี้แล้ว', new_path)
+            return
+        try:
+            os.rename(old_path, new_path)
+        except OSError as error:
+            QMessageBox.warning(self, 'เปลี่ยนชื่อไม่สำเร็จ', f'{old_path}\n\n{error}')
+            return
+        stat = os.stat(new_path)
+        items[0].setText(0, new_name)
+        items[0].setText(2, datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'))
+        items[0].setText(4, new_path)
+        items[0].setData(0, Qt.ItemDataRole.UserRole,
+                         (new_path, data[1], data[2], stat.st_mtime_ns if data[2] is None else None))
+        parent = items[0].parent()
+        if parent.data(0, Qt.ItemDataRole.UserRole) == 'name':
+            parent.setText(0, f'ชื่อคล้ายกัน (ผลสแกนเดิม; มีการเปลี่ยนชื่อ) ({parent.childCount()} ไฟล์)')
+        self.status.setText('เปลี่ยนชื่อไฟล์แล้ว ข้อมูลแถวนี้อัปเดตทันที; กลุ่มชื่อคล้ายอาจต้องสแกนใหม่เพื่อจัดกลุ่มตามชื่อปัจจุบัน')
+
     def open_selected(self):
         for item in self.tree.selectedItems():
             if item.data(0, Qt.ItemDataRole.UserRole):
@@ -307,6 +368,7 @@ class Window(QMainWindow):
             return
         success = 0
         errors = []
+        deleted_paths = set()
         for path, size, sha, scan_mtime_ns in selected:
             try:
                 if not os.path.isfile(path):
@@ -320,6 +382,7 @@ class Window(QMainWindow):
                     os.remove(path)
                     if os.path.lexists(path):
                         raise OSError('ลบไฟล์แล้ว แต่ยังพบไฟล์ที่ตำแหน่งเดิม')
+                    deleted_paths.add(path)
                 else:
                     # Preserve relative directory layout and avoid overwriting existing files.
                     relative = os.path.relpath(path, self.root)
@@ -339,12 +402,32 @@ class Window(QMainWindow):
                 success += 1
             except Exception as e:
                 errors.append(f'{path}: {e}')
-        QMessageBox.information(self, 'ผลการดำเนินการ',
-            f'สำเร็จ {success} ไฟล์ • ไม่สำเร็จ {len(errors)} ไฟล์' +
-            ('\n\n' + '\n'.join(errors[:10]) if errors else '') +
-            '\n\nกรุณาสแกนใหม่เพื่ออัปเดตผลลัพธ์')
-        self.tree.clear()
-        self.status.setText('ข้อมูลเปลี่ยนแปลงแล้ว กรุณาสแกนใหม่')
+        result_message = f'สำเร็จ {success} ไฟล์ • ไม่สำเร็จ {len(errors)} ไฟล์'
+        if action == 'delete':
+            for parent_index in range(self.tree.topLevelItemCount() - 1, -1, -1):
+                parent = self.tree.topLevelItem(parent_index)
+                for child_index in range(parent.childCount() - 1, -1, -1):
+                    child = parent.child(child_index)
+                    data = child.data(0, Qt.ItemDataRole.UserRole)
+                    if isinstance(data, tuple) and data[0] in deleted_paths:
+                        parent.removeChild(child)
+                if parent.childCount() < 2:
+                    self.tree.takeTopLevelItem(parent_index)
+                elif parent.childCount():
+                    title = re.sub(r'\(\d+ ไฟล์\)$', f'({parent.childCount()} ไฟล์)', parent.text(0))
+                    parent.setText(0, title)
+            if success:
+                result_message += '\n\nนำไฟล์ที่ลบสำเร็จออกจากรายการแล้ว กลุ่มที่ยังเหลือไฟล์ซ้ำจะแสดงต่อไป'
+                self.status.setText(f'ลบแล้ว {success} ไฟล์; อัปเดตรายการบนหน้าจอแล้ว')
+            else:
+                self.status.setText('ไม่มีไฟล์ถูกลบ รายการบนหน้าจอยังคงเดิม')
+        else:
+            result_message += '\n\nกรุณาสแกนใหม่เพื่ออัปเดตผลลัพธ์'
+            self.tree.clear()
+            self.status.setText('ข้อมูลเปลี่ยนแปลงแล้ว กรุณาสแกนใหม่')
+        if errors:
+            result_message += '\n\n' + '\n'.join(errors[:10])
+        QMessageBox.information(self, 'ผลการดำเนินการ', result_message)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
