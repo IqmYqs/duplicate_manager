@@ -12,8 +12,6 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QTreeWidget, QTreeWidgetItem, QLabel, QMessageBox,
     QProgressBar, QAbstractItemView, QHeaderView)
-from send2trash import send2trash
-
 CHUNK = 1024 * 1024
 
 def fmt_size(n):
@@ -62,7 +60,7 @@ class Scanner(QThread):
                     st = os.stat(path)
                     if os.path.isfile(path):
                         by_size[st.st_size].append(path)
-                        files.append((path, st.st_size, st.st_mtime))
+                        files.append((path, st.st_size, st.st_mtime, st.st_mtime_ns))
                 except OSError as e:
                     errors.append(f'{path}: {e}')
         candidates = [p for paths in by_size.values() if len(paths) > 1 for p in paths]
@@ -86,13 +84,13 @@ class Scanner(QThread):
         groups.sort(key=lambda x: (-x[0][0], x[1][0][0].casefold()))
         exact_path_sets = [set(path for path, _ in items) for _, items in groups]
         by_name = defaultdict(list)
-        for path, size, mtime in files:
+        for path, size, mtime, mtime_ns in files:
             key = name_match_key(os.path.basename(path))
             if len(key) >= 4:
-                by_name[key].append((path, size, mtime))
+                by_name[key].append((path, size, mtime, mtime_ns))
         name_groups = []
         for key, items in by_name.items():
-            paths = {path for path, _, _ in items}
+            paths = {path for path, _, _, _ in items}
             if len(items) > 1 and not any(paths <= exact_paths for exact_paths in exact_path_sets):
                 name_groups.append((key, sorted(items, key=lambda x: x[0].casefold())))
         name_groups.sort(key=lambda x: x[0])
@@ -129,11 +127,11 @@ class Window(QMainWindow):
         self.tree.setAlternatingRowColors(True)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        self.tree.itemDoubleClicked.connect(self.open_location)
+        self.tree.itemDoubleClicked.connect(self.open_file)
         layout.addWidget(self.tree)
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
-        self.status = QLabel('เลือกโฟลเดอร์เพื่อเริ่มต้น • ดับเบิลคลิกไฟล์เพื่อเปิดตำแหน่ง')
+        self.status = QLabel('เลือกโฟลเดอร์เพื่อเริ่มต้น • ดับเบิลคลิกไฟล์เพื่อเปิดไฟล์')
         layout.addWidget(self.status)
         actions = QHBoxLayout()
         for label, callback in [('เลือกไฟล์ซ้ำอัตโนมัติ', self.auto_select),
@@ -141,7 +139,7 @@ class Window(QMainWindow):
                                 ('เปิดตำแหน่ง', self.open_selected),
                                 ('Copy', lambda: self.perform('copy')),
                                 ('Move', lambda: self.perform('move')),
-                                ('ลบลง Recycle Bin', lambda: self.perform('delete'))]:
+                                ('ลบถาวร', lambda: self.perform('delete'))]:
             b = QPushButton(label)
             b.clicked.connect(callback)
             actions.addWidget(b)
@@ -190,7 +188,7 @@ class Window(QMainWindow):
             for path, mtime in items:
                 child = QTreeWidgetItem(parent, [Path(path).name, fmt_size(size),
                     datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S'), sha, path])
-                child.setData(0, Qt.ItemDataRole.UserRole, (path, size, sha))
+                child.setData(0, Qt.ItemDataRole.UserRole, (path, size, sha, None))
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Unchecked)
             total_redundant += len(items) - 1
@@ -199,11 +197,12 @@ class Window(QMainWindow):
             parent = QTreeWidgetItem(self.tree, [f'ชื่อคล้ายกัน: {key} ({len(items)} ไฟล์)', '', '', '', ''])
             parent.setData(0, Qt.ItemDataRole.UserRole, 'name')
             parent.setFlags(parent.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-            for path, size, mtime in items:
+            for path, size, mtime, mtime_ns in items:
                 child = QTreeWidgetItem(parent, [Path(path).name, fmt_size(size),
                     datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S'), '', path])
-                child.setData(0, Qt.ItemDataRole.UserRole, (path, size, None))
-                child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                child.setData(0, Qt.ItemDataRole.UserRole, (path, size, None, mtime_ns))
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Unchecked)
             parent.setExpanded(True)
         self.progress.setValue(100)
         self.status.setText(f'พบไฟล์ซ้ำจริง {len(groups):,} กลุ่ม • ชื่อคล้าย {len(name_groups):,} กลุ่ม • ไฟล์ส่วนเกิน {total_redundant:,} ไฟล์ • ข้อผิดพลาด {len(errors):,} รายการ')
@@ -218,29 +217,50 @@ class Window(QMainWindow):
                 yield parent, [parent.child(j) for j in range(parent.childCount())]
 
     def auto_select(self):
+        self.clear_checks()
         for _, items in self.children():
             for i, item in enumerate(items):
                 item.setCheckState(0, Qt.CheckState.Unchecked if i == 0 else Qt.CheckState.Checked)
 
     def clear_checks(self):
-        for _, items in self.children():
-            for item in items:
-                item.setCheckState(0, Qt.CheckState.Unchecked)
+        for i in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(i)
+            if parent.data(0, Qt.ItemDataRole.UserRole) in ('content', 'name'):
+                for j in range(parent.childCount()):
+                    parent.child(j).setCheckState(0, Qt.CheckState.Unchecked)
 
     def selected_paths(self):
-        return [item.data(0, Qt.ItemDataRole.UserRole)
-                for _, items in self.children() for item in items
-                if item.checkState(0) == Qt.CheckState.Checked]
+        selected = []
+        for i in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(i)
+            if parent.data(0, Qt.ItemDataRole.UserRole) in ('content', 'name'):
+                selected.extend(parent.child(j).data(0, Qt.ItemDataRole.UserRole)
+                                for j in range(parent.childCount())
+                                if parent.child(j).checkState(0) == Qt.CheckState.Checked)
+        return selected
 
     def open_location(self, item, column=0):
         data = item.data(0, Qt.ItemDataRole.UserRole)
-        if data:
+        if isinstance(data, tuple):
             path = data[0]
             if os.path.exists(path):
                 import subprocess
                 subprocess.Popen(['explorer.exe', '/select,', os.path.normpath(path)])
             else:
                 QMessageBox.warning(self, 'ไม่พบไฟล์', path)
+
+    def open_file(self, item, column=0):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, tuple):
+            return
+        path = data[0]
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, 'ไม่พบไฟล์', path)
+            return
+        try:
+            os.startfile(path)
+        except OSError as error:
+            QMessageBox.warning(self, 'เปิดไฟล์ไม่สำเร็จ', f'{path}\n\n{error}')
 
     def open_selected(self):
         for item in self.tree.selectedItems():
@@ -273,19 +293,33 @@ class Window(QMainWindow):
                     QMessageBox.warning(self, 'ป้องกันการลบทั้งหมด',
                         'มีอย่างน้อยหนึ่งกลุ่มที่เลือกทุกไฟล์ กรุณาเหลือไฟล์อย่างน้อยหนึ่งรายการต่อกลุ่ม')
                     return
-        verb = {'copy': 'คัดลอก', 'move': 'ย้าย', 'delete': 'ส่งไป Recycle Bin'}[action]
+        similar_count = sum(sha is None for _, _, sha, _ in selected)
+        similar_warning = (f'\n{similar_count} ไฟล์เป็นเพียงชื่อคล้ายกัน ไม่ได้ยืนยันว่าเนื้อหาซ้ำ\n'
+                           if similar_count else '')
+        verb = {'copy': 'คัดลอก', 'move': 'ย้าย', 'delete': 'ลบถาวร'}[action]
+        permanent_warning = ('การลบนี้จะลบไฟล์ออกจากเครื่องทันที ไม่ผ่าน Recycle Bin และกู้คืนไม่ได้\n'
+                             if action == 'delete' else '')
         if QMessageBox.question(self, 'ยืนยัน', f'{verb} {len(selected)} ไฟล์?\n' +
             (f'ปลายทาง: {target}\n' if target else '') +
-            'โปรแกรมจะตรวจสอบ Hash อีกครั้งก่อนดำเนินการ') != QMessageBox.StandardButton.Yes:
+            permanent_warning +
+            similar_warning +
+            'โปรแกรมจะตรวจสอบว่าไฟล์ไม่เปลี่ยนแปลงก่อนดำเนินการ') != QMessageBox.StandardButton.Yes:
             return
         success = 0
         errors = []
-        for path, size, sha in selected:
+        for path, size, sha, scan_mtime_ns in selected:
             try:
-                if not os.path.isfile(path) or os.path.getsize(path) != size or digest(path) != sha:
+                if not os.path.isfile(path):
+                    raise ValueError('ไฟล์เปลี่ยนแปลงหลังสแกน')
+                st = os.stat(path)
+                if st.st_size != size or (sha and digest(path) != sha) or (
+                    sha is None and st.st_mtime_ns != scan_mtime_ns
+                ):
                     raise ValueError('ไฟล์เปลี่ยนแปลงหลังสแกน')
                 if action == 'delete':
-                    send2trash(path)
+                    os.remove(path)
+                    if os.path.lexists(path):
+                        raise OSError('ลบไฟล์แล้ว แต่ยังพบไฟล์ที่ตำแหน่งเดิม')
                 else:
                     # Preserve relative directory layout and avoid overwriting existing files.
                     relative = os.path.relpath(path, self.root)

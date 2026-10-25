@@ -21,14 +21,14 @@ Double-click `build_exe.bat`. Output: `dist\DuplicateFileManager.exe`.
 1. Select a directory and click Scan.
 2. Expand duplicate groups. Double-click a file to reveal it in Explorer.
 3. Tick individual files, or choose Auto-select (keeps first alphabetical path in each group).
-4. Choose Copy, Move, or Recycle Bin. Confirm the action.
+4. Choose Copy, Move, or permanent delete. Permanent delete bypasses the Recycle Bin and cannot be undone.
 5. Rescan after changes.
 
 ## Notes
 - Duplicate means identical file size and SHA-256 content digest, regardless of filename.
 - Skips symlinks. Inaccessible files are reported. No system folders should be scanned without understanding the consequences.
 - Auto-select is based on alphabetical path, **not** file age or importance.
-- Delete blocks selection of all copies of a group. Copy/Move allow all selections.
+- Permanent delete blocks selection of all copies of an exact-duplicate group. Copy/Move allow all selections.
 - Move/Copy preserve folder structure relative to the selected scan root; collisions receive unique suffixes.
 - No overwrite is intentional. Existing files are not replaced.
 - If destination lies inside scanned root, copied files may appear in subsequent scans.
